@@ -8,7 +8,7 @@ between different online database formats.
 
 Currently supported:
   Input:  Motostat.pl CSV export
-  Output: Spritmonitor.de CSV import format
+  Output: Spritmonitor.de CSV import format (fuelings + costs)
 
 Designed for extensibility with new input sources, output targets,
 and transport mechanisms (file, API).
@@ -21,9 +21,9 @@ import logging
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from enum import Enum
+from datetime import date
 from pathlib import Path
+from typing import Literal
 
 # ---------------------------------------------------------------------------
 # Configuration & Constants
@@ -38,20 +38,42 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Canonical Data Model
 # ---------------------------------------------------------------------------
-# All readers produce instances of these dataclasses.
-# All writers consume instances of these dataclasses.
+# All readers produce instances of CostEntry.
+# All writers consume instances of CostEntry.
 # This decouples input format knowledge from output format knowledge.
 
+CostTypeValue = Literal["fueling", "cost"]
+FuelingTypeValue = Literal["full", "partial", "first", "invalid"]
+TiresTypeValue = Literal["summer", "winter", "all_season"]
+DrivingStyleValue = Literal["eco", "normal", "dynamic"]
 
-class CostType(Enum):
-    """Enumeration of supported cost entry types."""
-    FUELING = "fueling"
-    REPAIR = "repair"
-    MOT = "mot"              # periodic technical inspection
-    INSURANCE = "insurance"
-    SERVICE = "service"
-    OTHER = "other"
-
+# Normalised fuel types based on Motostat strings and Spritmonitor API
+FuelTypeValue = Literal[
+    "diesel",
+    "premium_diesel",
+    "biodiesel",
+    "gtl_diesel",
+    "hvo100",
+    "vegetable_oil",
+    "petrol_95",
+    "petrol_98",
+    "petrol_super",
+    "petrol_super_plus",
+    "petrol_100",
+    "petrol_100_plus",
+    "petrol_normal",
+    "e10",
+    "two_stroke",
+    "bioethanol",
+    "lpg",
+    "cng",
+    "cng_h",
+    "cng_l",
+    "electricity",
+    "green_electricity",
+    "adblue",
+    "hydrogen"
+]
 
 @dataclass
 class CostEntry:
@@ -61,27 +83,73 @@ class CostEntry:
     This is the intermediate format that bridges all readers and writers.
     Fields are a superset of what various sources/targets may need.
     Optional fields are None when not applicable or not available.
+
+    Design principles:
+    - Store data in human-readable, semantic form (not encoded integers)
+    - Encoding/decoding of service-specific formats is the responsibility
+      of the respective Reader/Writer classes
+    - Use the richest representation available (e.g. road type percentages
+      rather than bitmask indicating if a road type was included
+      in the route, since percentages can be reduced to bitmask
+      but not vice versa)
+    - Use Literal types where a fixed set of values is expected, for
+      static analysis safety without the ceremony of Enum classes
     """
+
+    # --- Core fields (applicable to all entry types) ---
     entry_date: date
-    cost_type: CostType
-    odometer_km: int | None = None              # total mileage at the time of entry
+    cost_type: CostTypeValue                    # "fueling" or "cost" - determines output routing
+    odometer_km: int | None = None              # total mileage at the time of entry (km)
+    trip_km: int | None = None                  # distance since last entry (km)
+    cost_total: float | None = None             # total cost (fuel cost for fuelings,
+                                                #   repair/service cost for non-fueling entries)
+    cost_currency: str | None = None            # ISO 4217 currency code (PLN, EUR, USD, etc.)
+    description: str | None = None              # Long text note
 
     # Fueling-specific fields
-    fuel_quantity_liters: float | None = None
-    fuel_price_per_liter: float | None = None
-    fuel_total_cost: float | None = None
-    fuel_type: str | None = None                # e.g., "diesel", "petrol_95", "lpg"
-    is_full_tank: bool | None = None            # full fill-up flag (important for consumption calc)
-    is_first_fueling: bool | None = None        # first fueling after reset — cannot calculate consumption
+    fuel_quantity_liters: float | None = None   # amount of fuel filled (liters)
+    fuel_price_per_liter: float | None = None   # price per liter (derived or from source)
+    fuel_total_cost: float | None = None        # total fuel price (derived or from source)
+    fuel_type: FuelTypeValue  | None = None     # canonical fuel type literal
+    fueling_type: FuelingTypeValue | None = None # "full", "partial", "first", "invalid"
 
-    # General cost fields (repairs, MOT, insurance, etc.)
-    cost_total: float | None = None
-    cost_currency: str = "PLN"
-    description: str | None = None
-    category: str | None = None                 # sub-category from source system
+    # --- Driving context fields ---
+    tires_type: TiresTypeValue | None = None  # "summer", "winter", "all_season"
+    driving_style: DrivingStyleValue | None = None  # "eco", "normal", "dynamic"
+    route_motorway_pct: int | None = None  # percentage of route on motorway (0-100)
+    route_country_pct: int | None = None  # percentage of route on country roads (0-100)
+    route_city_pct: int | None = None  # percentage of route in city (0-100)
+    air_condition_pct: int | None = None  # percentage of A/C usage (0-100)
 
-    # Metadata
-    source_raw: dict = field(default_factory=dict)  # preserve original row for debugging
+    # --- Board computer fields ---
+    bc_consumption: float | None = None  # board computer consumption (L/100km)
+    bc_quantity: float | None = None  # board computer fuel quantity (liters)
+    bc_avg_speed: float | None = None  # board computer average speed (km/h)
+
+    # --- Calculated / derived fields ---
+    consumption: float | None = None  # calculated real consumption (L/100km)
+
+    # --- Cost-specific fields (non-fueling) ---
+    category: str | None = None  # detailed sub-category from source system
+    #   (e.g., Motostat tags: "oil_and_filters",
+    #   "inspection", "tire_service_and_tires",
+    #   "electronics_and_electrics", "other")
+    #   Writer maps this to target taxonomy.
+    entry_name: str | None = None  # short human-readable label
+    #   (e.g., "Olej", "Przeglad", "akumulator")
+
+    # --- Location fields ---
+    fuel_company: str | None = None  # fuel station brand/company name
+    country: str | None = None  # country where entry occurred
+    area: str | None = None  # region/area
+    location: str | None = None  # specific location / address
+
+    # --- Insurance-specific fields ---
+    insurance_starts_on: date | None = None  # insurance coverage start date
+    insurance_ends_on: date | None = None  # insurance coverage end date
+
+    # --- Metadata ---
+    source_raw: dict = field(default_factory=dict)  # preserve original row for debugging/audit
 
 
 # ---------------------------------------------------------------------------
